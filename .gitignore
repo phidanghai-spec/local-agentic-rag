@@ -1,0 +1,65 @@
+# ==========================================
+# 1. Python & Virtual Environment
+# ==========================================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ==========================================
+# 2. Local AI Models & Vector Databases (Nặng)
+# ==========================================
+Ollama/
+ollama_models/
+*.gguf
+*.bin
+*.safetensors
+
+# Kho Vector ChromaDB (tự sinh lại bằng src/rag/indexing.py)
+chroma_db/
+chroma_cache_db/
+local_vector_db/
+.chroma/
+
+# FlashRank model cache cục bộ nếu lưu trong dự án
+flashrank_cache/
+.cache/
+
+# ==========================================
+# 3. Database tạm & Logs
+# ==========================================
+# Giữ lại data/erp_inventory.db (CSDL mẫu nhẹ), chỉ chặn file journal/lock và checkpoint khi chạy
+data/langgraph_checkpoints.sqlite*
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite3-journal
+*.log
+logs/
+agent_workspace/
+
+# ==========================================
+# 4. Secrets & Environment Variables
+# ==========================================
+.env
+.env.local
+.env.*.local
+
+# ==========================================
+# 5. IDE & Hệ điều hành (Windows / VS Code)
+# ==========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
