@@ -201,7 +201,7 @@ async def _stream_agent_events(
                 {
                     "type": "node_status",
                     "node": "semantic_cache",
-                    "message": f"⚡ Cache HIT (similarity={cached["similarity"]}) - trả lời ngay từ Semantic Cache.",
+                    "message": f"⚡ Cache HIT (similarity={cached['similarity']}) - trả lời ngay từ Semantic Cache.",
                 }
             )
             yield _format_sse({"type": "token", "content": cached["response"]})
