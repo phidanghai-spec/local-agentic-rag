@@ -38,6 +38,7 @@ flashrank_cache/
 # ==========================================
 # Giữ lại data/erp_inventory.db (CSDL mẫu nhẹ), chỉ chặn file journal/lock và checkpoint khi chạy
 data/langgraph_checkpoints.sqlite*
+evaluation/eval_runs_cache.json
 *.db-wal
 *.db-shm
 *.db-journal

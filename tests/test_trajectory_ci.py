@@ -882,3 +882,30 @@ def test_grade_prompt_has_no_domain_few_shot_bleed():
     assert not leaked, (
         f"Phát hiện thực thể thật rò rỉ trong GRADE_SYSTEM_PROMPT (nguy cơ Few-shot Bleed): {leaked}"
     )
+
+
+# =====================================================================
+# TEST 15: KHÓA CHỐNG POST-FILTERING STARVATION (PRE-FILTER DOMAIN)
+# =====================================================================
+def test_prefilter_prevents_domain_starvation_before_rerank():
+    """
+    Giả lập tập ứng viên có 3 chunk product_specs.md đứng trước 3 chunk rag_architecture.md.
+    Pre-filter phải loại sạch product_specs.md TRƯỚC khi cắt top_n để giữ trọn 3/3 chunk kiến trúc.
+    """
+    from src.rag.hybrid_retriever import prefilter_by_domain
+
+    mixed_candidates = [
+        Document(page_content="Thông số sản phẩm 1", metadata={"doc_domain": "product_catalog"}),
+        Document(page_content="Thông số sản phẩm 2", metadata={"doc_domain": "product_catalog"}),
+        Document(page_content="Chính sách bảo hành", metadata={"doc_domain": "product_catalog"}),
+        Document(page_content="[Mục: Thành phần cốt lõi]", metadata={"doc_domain": "system_architecture"}),
+        Document(page_content="[Mục: 2. Cơ chế Truy xuất Lai]", metadata={"doc_domain": "system_architecture"}),
+        Document(page_content="[Mục: 3. Tối ưu phần cứng]", metadata={"doc_domain": "system_architecture"}),
+    ]
+
+    query = "Hệ thống RAG sử dụng mô hình reranker nào và chạy trên phần cứng gì?"
+    prefiltered = prefilter_by_domain(mixed_candidates, query)
+
+    assert len(prefiltered) == 3
+    assert all(d.metadata["doc_domain"] == "system_architecture" for d in prefiltered)
+    assert any("Cơ chế Truy xuất Lai" in d.page_content for d in prefiltered)

@@ -1,0 +1,5 @@
+﻿,context_precision,context_recall,faithfulness,answer_relevancy
+comparison,0.0,1.0,1.0,0.5614
+multi_aspect,0.6667,1.0,0.8889,0.8815
+single_aspect,0.8333,1.0,0.6667,0.834
+OVERALL_IN_DOMAIN,0.5625,1.0,0.8333,0.7836

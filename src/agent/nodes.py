@@ -27,7 +27,7 @@ GRADE_SYSTEM_PROMPT = """Bạn là bộ lọc tài liệu cho hệ thống RAG. 
 QUY TẮC BẮT BUỘC:
 1. Tách câu hỏi thành từng vế/ý nhỏ (câu có 'và', 'hoặc', dấu phẩy thường gồm nhiều vế riêng).
 2. CHẤM 'yes' nếu ĐOẠN TÀI LIỆU THỰC TẾ chứa thông tin hoặc từ khóa trả lời được ÍT NHẤT MỘT VẾ của câu hỏi.
-3. CHẤM 'no' nếu ĐOẠN TÀI LIỆU THỰC TẾ nói về đối tượng khác hoặc không chứa thông tin cho bất kỳ vế nào.
+3. CHẤM 'no' nếu ĐOẠN TÀI LIỆU THỰC TẾ nói về đối tượng/sản phẩm khác hoặc không chứa thông tin cho bất kỳ vế nào. Đặc biệt, nếu câu hỏi chỉ nêu đích danh một sản phẩm cụ thể (mẫu A) và KHÔNG phải câu hỏi so sánh nhiều sản phẩm, PHẢI chấm 'no' cho các đoạn chỉ mô tả giá bán hoặc thông số của sản phẩm khác (mẫu B).
 4. TRUNG THỰC TUỆT ĐỐI: Trường `matched_aspect` CHỈ ĐƯỢC phép nhắc tên khái niệm/con số có thật trong ĐOẠN TÀI LIỆU THỰC TẾ. Tuyệt đối KHÔNG sao chép nội dung từ ví dụ minh họa. Nếu không khớp, ghi đúng chuỗi 'Không có'.
 
 VÍ DỤ MINH HỌA (CHỈ ĐỂ HIỂU CÁCH LÀM, KHÔNG DÙNG NỘI DUNG NÀY ĐỂ TRẢ LỜI):

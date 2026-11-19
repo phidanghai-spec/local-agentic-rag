@@ -35,7 +35,7 @@ class Settings(BaseModel):
     vector_k: int = Field(default=5)
     ensemble_weights: list[float] = Field(default=[0.4, 0.6])
     flashrank_model: str = Field(default="ms-marco-MultiBERT-L-12")
-    flashrank_top_n: int = Field(default=4)
+    flashrank_top_n: int = Field(default=6)
 
     # Cấu hình LangGraph Self-Correction
     max_retries: int = Field(default=2)

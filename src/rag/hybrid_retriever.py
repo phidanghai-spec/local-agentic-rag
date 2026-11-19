@@ -3,17 +3,12 @@
 import math
 from typing import Any, Dict, List, Optional
 
-from langchain_classic.retrievers import ContextualCompressionRetriever, EnsembleRetriever
-from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
-from langchain_chroma import Chroma
-from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
 from src.config import settings
-from src.rag.indexing import build_or_load_vectorstore
 
 
-def restore_documents_from_chroma(vectorstore: Chroma) -> List[Document]:
+def restore_documents_from_chroma(vectorstore: Any) -> List[Document]:
     """Khôi phục danh sách Document từ ChromaDB để dựng lại BM25 không cần embed lại."""
     stored = vectorstore.get(include=["documents", "metadatas"])
     raw_docs = stored.get("documents") or []
@@ -40,10 +35,15 @@ def _matches_filter(doc: Document, metadata_filter: Optional[Dict[str, Any]]) ->
 
 
 def create_hybrid_retriever(
-    vectorstore: Optional[Chroma] = None,
+    vectorstore: Optional[Any] = None,
     metadata_filter: Optional[Dict[str, Any]] = None,
-) -> ContextualCompressionRetriever:
+) -> Any:
     """Tạo EnsembleRetriever (BM25 + Chroma Cosine) bọc trong FlashRank Reranker."""
+    from langchain_classic.retrievers import ContextualCompressionRetriever, EnsembleRetriever
+    from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
+    from langchain_community.retrievers import BM25Retriever
+    from src.rag.indexing import build_or_load_vectorstore
+
     store = vectorstore or build_or_load_vectorstore()
     all_docs = restore_documents_from_chroma(store)
 
@@ -101,8 +101,14 @@ def _sigmoid_to_logit(score: float) -> float:
 def _infer_query_domain(query: str) -> Optional[str]:
     """Nhận diện nhanh ý định câu hỏi thuộc về kiến trúc hệ thống hay thông số sản phẩm bán ra."""
     q = query.lower()
-    arch_keywords = ("kiến trúc", "rag", "rerank", "flashrank", "ollama", "langgraph", "triển khai", "hệ thống", "mô hình")
-    prod_keywords = ("giá bán", "giá niêm yết", "tồn kho", "ai-ws-x1", "bảo hành", "mua", "chiết khấu", "mã sản phẩm")
+    arch_keywords = (
+        "kiến trúc", "rag", "rerank", "flashrank", "ollama", "langgraph",
+        "triển khai", "hệ thống", "mô hình", "bm25", "chromadb", "embedding", "crag",
+    )
+    prod_keywords = (
+        "giá bán", "giá niêm yết", "tồn kho", "ai-ws-x1", "ssd-ent-4t",
+        "bảo hành", "đổi trả", "ổ cứng", "mua", "chiết khấu", "mã sản phẩm",
+    )
 
     has_arch = any(k in q for k in arch_keywords)
     has_prod = any(k in q for k in prod_keywords)
@@ -112,6 +118,24 @@ def _infer_query_domain(query: str) -> Optional[str]:
     if has_prod and not has_arch:
         return "product_catalog"
     return None
+
+
+def prefilter_by_domain(docs: List[Document], query: str) -> List[Document]:
+    """
+    Lọc trước theo doc_domain ngay sau EnsembleRetriever và TRƯỚC KHI chạy FlashRank.
+    Ngăn tình trạng tài liệu sai domain chiếm mất slot top_n của Cross-Encoder.
+    """
+    if not docs:
+        return []
+
+    target_domain = _infer_query_domain(query)
+    if not target_domain:
+        return docs
+
+    same_domain_docs = [
+        d for d in docs if d.metadata.get("doc_domain") == target_domain
+    ]
+    return same_domain_docs if same_domain_docs else docs
 
 
 def filter_reranked_documents(
@@ -182,26 +206,39 @@ async def retrieve_with_fallback(
     metadata_filter: Optional[Dict[str, Any]] = None,
     min_relevance_score: float = 0.35,
 ) -> List[Document]:
-    """Truy xuất kết hợp lọc ngưỡng điểm Logit FlashRank, loại nhiễu và cơ chế dự phòng."""
+    """
+    Pipeline chuẩn Pre-filter:
+    1. EnsembleRetriever (BM25 + Chroma Cosine) lấy tập ứng viên rộng.
+    2. Pre-filter theo doc_domain TRƯỚC khi đưa vào FlashRank.
+    3. FlashRank Reranker chấm điểm riêng trên các ứng viên đúng domain.
+    4. Logit Margin + Jaccard Filter chốt danh sách sạch.
+    """
+    from src.rag.indexing import build_or_load_vectorstore
+
     store = build_or_load_vectorstore()
     try:
         compression_retriever = create_hybrid_retriever(
             vectorstore=store,
             metadata_filter=metadata_filter,
         )
-        reranked_docs = await compression_retriever.ainvoke(query)
+        raw_candidates = await compression_retriever.base_retriever.ainvoke(query)
 
-        if metadata_filter:
-            top_score = max(
-                (float(d.metadata.get("relevance_score", 0.0)) for d in reranked_docs),
-                default=0.0,
+        if metadata_filter and not raw_candidates:
+            fallback_retriever = create_hybrid_retriever(
+                vectorstore=store,
+                metadata_filter=None,
             )
-            if not reranked_docs or top_score < min_relevance_score:
-                fallback_retriever = create_hybrid_retriever(
-                    vectorstore=store,
-                    metadata_filter=None,
-                )
-                reranked_docs = await fallback_retriever.ainvoke(query)
+            raw_candidates = await fallback_retriever.base_retriever.ainvoke(query)
+
+        if not raw_candidates:
+            return []
+
+        domain_candidates = prefilter_by_domain(raw_candidates, query)
+        reranked_docs = list(
+            compression_retriever.base_compressor.compress_documents(
+                domain_candidates, query
+            )
+        )
 
         precision_docs = filter_reranked_documents(reranked_docs, query=query)
         if precision_docs:

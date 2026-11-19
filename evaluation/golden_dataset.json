@@ -1,0 +1,74 @@
+[
+  {
+    "id": "Q01",
+    "category": "single_aspect",
+    "target_domain": "system_architecture",
+    "question": "Cơ chế tìm kiếm lai (Hybrid Search) trong hệ thống kết hợp những thành phần nào và tỷ trọng ra sao?",
+    "ground_truth": "Hệ thống kết hợp BM25 Retriever (Sparse Retrieval) với trọng số 0.4 và Chroma Vector Retriever (Dense Retrieval) với trọng số 0.6."
+  },
+  {
+    "id": "Q02",
+    "category": "single_aspect",
+    "target_domain": "product_catalog",
+    "question": "Giá niêm yết và thời gian bảo hành của Laptop AI Workstation X1 (AI-WS-X1) là bao nhiêu?",
+    "ground_truth": "Laptop AI Workstation X1 (SKU: AI-WS-X1) có giá niêm yết 58,900,000 VNĐ và bảo hành 36 tháng chính hãng tại trung tâm bảo hành Hà Nội và TP.HCM."
+  },
+  {
+    "id": "Q03",
+    "category": "single_aspect",
+    "target_domain": "product_catalog",
+    "question": "Chính sách đổi trả sản phẩm áp dụng trong thời hạn bao nhiêu ngày?",
+    "ground_truth": "Khách hàng doanh nghiệp được phép đổi trả miễn phí trong vòng 14 ngày kể từ ngày xuất hóa đơn VAT nếu phát sinh lỗi kỹ thuật từ nhà sản xuất."
+  },
+  {
+    "id": "Q04",
+    "category": "multi_aspect",
+    "target_domain": "system_architecture",
+    "question": "Hệ thống sử dụng mô hình Reranker nào và chạy trên phần cứng nào?",
+    "ground_truth": "Hệ thống sử dụng mô hình Cross-Encoder FlashRank ms-marco-MultiBERT-L-12 chạy trên CPU và giữ lại top_n=3 đoạn văn bản chất lượng nhất."
+  },
+  {
+    "id": "Q05",
+    "category": "multi_aspect",
+    "target_domain": "system_architecture",
+    "question": "Hệ thống dùng mô hình ngôn ngữ, mô hình embedding nào và giới hạn tối đa bao nhiêu lần thử lại khi tài liệu không đạt?",
+    "ground_truth": "Hệ thống sử dụng mô hình ngôn ngữ qwen2.5-coder:7b qua Ollama, mô hình nhúng nomic-embed-text (768 chiều) và vòng lặp CRAG tự động viết lại truy vấn tối đa 2 lần (retry_count <= 2)."
+  },
+  {
+    "id": "Q06",
+    "category": "multi_aspect",
+    "target_domain": "product_catalog",
+    "question": "Ổ cứng SSD-ENT-4T có mức giá niêm yết bao nhiêu và được bảo hành trong mấy tháng?",
+    "ground_truth": "Ổ cứng SSD-ENT-4T có giá niêm yết 9,500,000 VNĐ và bảo hành 60 tháng đổi mới 1-1 nếu lỗi phần cứng."
+  },
+  {
+    "id": "Q07",
+    "category": "comparison",
+    "target_domain": "product_catalog",
+    "question": "So sánh giá niêm yết và thời gian bảo hành giữa Laptop AI Workstation X1 và ổ cứng SSD-ENT-4T.",
+    "ground_truth": "Laptop AI Workstation X1 có giá niêm yết 58,900,000 VNĐ với bảo hành 36 tháng chính hãng, trong khi ổ cứng SSD-ENT-4T có giá niêm yết 9,500,000 VNĐ nhưng thời gian bảo hành dài hơn là 60 tháng."
+  },
+  {
+    "id": "Q08",
+    "category": "comparison",
+    "target_domain": "system_architecture",
+    "question": "Sự khác nhau về vai trò giữa BM25, ChromaDB và FlashRank trong đường ống truy xuất của hệ thống là gì?",
+    "ground_truth": "BM25 tìm kiếm khớp từ khóa chính xác (k=5, trọng số 0.4), ChromaDB tìm kiếm theo ngữ nghĩa bằng vector Cosine Similarity (k=5, trọng số 0.6), còn FlashRank (ms-marco-MultiBERT-L-12) chạy trên CPU để chấm điểm lại và giữ lại top_n=3 đoạn văn bản chất lượng nhất."
+  },
+  {
+    "id": "Q09",
+    "category": "out_of_scope",
+    "target_domain": "none",
+    "question": "Card đồ họa RTX 5090 Ti trong danh mục công ty có giá bán bao nhiêu và bảo hành mấy năm?",
+    "ground_truth": "Tài liệu hiện tại không có thông tin về card đồ họa RTX 5090 Ti.",
+    "forbidden_hallucination_terms": ["triệu", "vnđ", "000", "36 tháng", "60 tháng", "24 tháng"]
+  },
+  {
+    "id": "Q10",
+    "category": "out_of_scope",
+    "target_domain": "none",
+    "question": "Hệ thống RAG này có sử dụng OpenAI GPT-4o API và triển khai cụm Kubernetes trên AWS EKS không?",
+    "ground_truth": "Tài liệu không đề cập đến việc sử dụng OpenAI GPT-4o API hay triển khai Kubernetes trên AWS EKS; hệ thống vận hành hoàn toàn nội bộ (On-premise).",
+    "forbidden_hallucination_terms": ["eks cluster", "openai_api_key", "aws lambda", "có sử dụng gpt-4o"]
+  }
+]
