@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
 import time
@@ -137,18 +138,21 @@ class SemanticCache:
 
     def _get_collection(self):
         if self._collection is None:
-            import chromadb  # lazy import
+            try:
+                import chromadb  # lazy import
 
-            if self.persist_directory is not None:
-                self.persist_directory.mkdir(parents=True, exist_ok=True)
-                client = chromadb.PersistentClient(path=str(self.persist_directory))
-            else:
-                client = chromadb.EphemeralClient()
-                # EphemeralClient dùng chung 1 hệ thống trong process -> tên collection duy nhất
-                self.collection_name = f"{self.collection_name}_{uuid.uuid4().hex[:8]}"
-            self._collection = client.get_or_create_collection(
-                name=self.collection_name, metadata={"hnsw:space": "cosine"}
-            )
+                if self.persist_directory is not None:
+                    self.persist_directory.mkdir(parents=True, exist_ok=True)
+                    client = chromadb.PersistentClient(path=str(self.persist_directory))
+                else:
+                    client = chromadb.EphemeralClient()
+                    # EphemeralClient dùng chung 1 hệ thống trong process -> tên collection duy nhất
+                    self.collection_name = f"{self.collection_name}_{uuid.uuid4().hex[:8]}"
+                self._collection = client.get_or_create_collection(
+                    name=self.collection_name, metadata={"hnsw:space": "cosine"}
+                )
+            except ImportError:
+                self._collection = _InMemoryCosineCollection()
         return self._collection
 
     def _evict_expired(self) -> int:
@@ -251,3 +255,70 @@ class SemanticCache:
                 "ttl_seconds": self.ttl_seconds,
                 "similarity_threshold": self.similarity_threshold,
             }
+
+
+class _InMemoryCosineCollection:
+    """Fallback nhẹ thuần Python khi môi trường CI không cài chromadb."""
+
+    def __init__(self) -> None:
+        self._items: Dict[str, Dict[str, Any]] = {}
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def add(
+        self,
+        ids: List[str],
+        embeddings: List[List[float]],
+        documents: List[str],
+        metadatas: List[Dict[str, Any]],
+    ) -> None:
+        for cid, emb, doc, meta in zip(ids, embeddings, documents, metadatas):
+            self._items[cid] = {
+                "embedding": [float(x) for x in emb],
+                "document": doc,
+                "metadata": dict(meta),
+            }
+
+    upsert = add
+
+    def get(self, include: Optional[List[str]] = None) -> Dict[str, List[Any]]:
+        ids = list(self._items.keys())
+        return {
+            "ids": ids,
+            "documents": [self._items[i]["document"] for i in ids],
+            "metadatas": [self._items[i]["metadata"] for i in ids],
+        }
+
+    def delete(self, ids: List[str]) -> None:
+        for cid in ids:
+            self._items.pop(cid, None)
+
+    @staticmethod
+    def _cosine_distance(a: List[float], b: List[float]) -> float:
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(x * x for x in b))
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 1.0
+        sim = sum(x * y for x, y in zip(a, b)) / (norm_a * norm_b)
+        return 1.0 - max(min(sim, 1.0), -1.0)
+
+    def query(
+        self,
+        query_embeddings: List[List[float]],
+        n_results: int = 1,
+        include: Optional[List[str]] = None,
+    ) -> Dict[str, List[List[Any]]]:
+        q_emb = query_embeddings[0]
+        scored = [
+            (self._cosine_distance(q_emb, item["embedding"]), cid, item)
+            for cid, item in self._items.items()
+        ]
+        scored.sort(key=lambda x: x[0])
+        top = scored[:n_results]
+        return {
+            "ids": [[x[1] for x in top]],
+            "distances": [[x[0] for x in top]],
+            "documents": [[x[2]["document"] for x in top]],
+            "metadatas": [[x[2]["metadata"] for x in top]],
+        }
