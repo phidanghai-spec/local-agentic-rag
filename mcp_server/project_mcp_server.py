@@ -81,6 +81,36 @@ def calculate_order_total(unit_price: float, quantity: int, discount_percent: fl
 
 
 @mcp.tool()
+def list_erp_orders(limit: int = 20) -> str:
+    """Liệt kê các đơn hàng ERP đã chốt gần nhất (kèm khóa idempotency) từ SQLite."""
+    limit = max(1, min(int(limit), 200))
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(erp_orders)").fetchall()}
+            if not columns:
+                return "Chưa có đơn hàng ERP nào được chốt."
+            idem_col = "idempotency_key" if "idempotency_key" in columns else "NULL"
+            rows = conn.execute(
+                f"SELECT order_id, sku, quantity, discount_percent, total_vnd, status, created_at, {idem_col} "
+                "FROM erp_orders ORDER BY order_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        return f"Lỗi đọc bảng erp_orders: {exc}"
+
+    if not rows:
+        return "Chưa có đơn hàng ERP nào được chốt."
+
+    lines = [f"{len(rows)} đơn hàng ERP gần nhất:"]
+    for oid, sku, qty, disc, total, status, created, idem in rows:
+        lines.append(
+            f"#{oid} | {sku} x{qty} | CK {disc}% | {total:,.0f} VNĐ | {status} | "
+            f"{created} | key={idem or '-'}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def read_technical_doc(filename: str) -> str:
     """Đọc toàn bộ nội dung một file tài liệu .md trong thư mục data/ một cách an toàn."""
     safe_name = Path(filename).name

@@ -2,11 +2,14 @@
 
 import re
 import sqlite3
-from typing import Any, Dict, List
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableConfig
 from langchain_ollama import ChatOllama
 
 from src.agent.state import (
@@ -19,6 +22,54 @@ from src.config import BASE_DIR, settings
 from src.utils.context_assembler import DynamicContextAssembler
 
 ORDER_COMMIT_KEYWORDS = ("chốt đơn", "đặt mua", "tạo đơn hàng", "xác nhận mua", "trừ kho")
+
+# None => dùng BASE_DIR/data/erp_inventory.db tại thời điểm gọi (cho phép test đổi BASE_DIR); gán Path để ghi đè.
+ERP_DB_PATH: Optional[Path] = None
+
+
+def _erp_db_path() -> Path:
+    return Path(ERP_DB_PATH) if ERP_DB_PATH else BASE_DIR / "data" / "erp_inventory.db"
+
+OUT_OF_SCOPE_REFUSAL = "Xin lỗi, tài liệu hiện tại không có thông tin về nội dung bạn hỏi."
+
+# matched_aspect của grader mang nghĩa "không khớp vế nào" (vd: 'Không có', 'Không khớp ...').
+_NO_MATCH_ASPECT_RE = re.compile(
+    r"^\s*(?:không\s+(?:có|khớp|liên\s+quan|tìm\s+thấy|chứa|đề\s+cập)|none|n/?a|no\s+match)\b",
+    re.IGNORECASE,
+)
+# Mã định danh cụ thể trong câu hỏi: chữ + số (K200, RTX4090) hoặc mã viết hoa có gạch nối (AI-WS-X1).
+_ENTITY_CODE_RE = re.compile(
+    r"\b(?=[\w\-.]*[A-Za-z])(?=[\w\-.]*\d)[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)*\b"
+    r"|\b[A-Z]{2,}(?:-[A-Z0-9]+)+\b"
+)
+
+
+def _extract_query_entities(question: str) -> List[str]:
+    """Trích các mã thực thể cụ thể (SKU/model) được nêu đích danh trong câu hỏi."""
+    entities: List[str] = []
+    for match in _ENTITY_CODE_RE.finditer(question or ""):
+        token = match.group(0).strip(".-_")
+        # Bỏ số đo đơn vị thuần (4TB, 5kg, 3b, 2.5GHz) vì tài liệu hay viết khác định dạng.
+        if not token or re.fullmatch(r"\d+(?:[.,]\d+)?[A-Za-z]{1,4}", token):
+            continue
+        if token.lower() not in (e.lower() for e in entities):
+            entities.append(token)
+    return entities
+
+
+def _normalize_for_match(text: str) -> str:
+    return re.sub(r"[\s\-_.]+", "", (text or "").lower())
+
+
+def _missing_entities(question: str, docs: List[Document]) -> List[str]:
+    """Các thực thể được hỏi đích danh nhưng KHÔNG xuất hiện trong bất kỳ chunk nào."""
+    corpus = _normalize_for_match(" ".join(d.page_content for d in docs))
+    return [e for e in _extract_query_entities(question) if _normalize_for_match(e) not in corpus]
+
+
+def _is_no_match_aspect(reason: str) -> bool:
+    """matched_aspect rỗng hoặc mang nghĩa phủ định ('Không có', 'Không khớp ...')."""
+    return not (reason or "").strip() or bool(_NO_MATCH_ASPECT_RE.match(reason))
 
 context_assembler = DynamicContextAssembler()
 
@@ -162,10 +213,12 @@ async def grade_documents(state: GraphState) -> Dict[str, Any]:
     filtered_docs: List[Document] = []
     filtered_citations: List[Dict[str, Any]] = []
     citations = state.get("citations", [])
+    grade_records: List[Dict[str, Any]] = []
 
     for idx, doc in enumerate(docs):
         source = doc.metadata.get("source", "unknown")
         score = float(doc.metadata.get("relevance_score", 0.0))
+        parse_failed = False
 
         try:
             res: GradeDocuments = await grader.ainvoke(
@@ -176,6 +229,9 @@ async def grade_documents(state: GraphState) -> Dict[str, Any]:
         except Exception as exc:
             decision = "yes" if score >= 0.85 else "no"
             reason = f"Fallback JSON parse error ({exc})"
+            parse_failed = True
+
+        grade_records.append({"decision": decision, "reason": reason, "parse_failed": parse_failed})
 
         print(
             f"[grade_documents] Chunk #{idx + 1} ({source} | flashrank={score:.3f}) "
@@ -188,6 +244,19 @@ async def grade_documents(state: GraphState) -> Dict[str, Any]:
                 filtered_citations.append(citations[idx])
 
     if not filtered_docs and docs:
+        # Cổng từ chối ngoài phạm vi: KHÔNG ép giữ chunk sai sản phẩm khi 0/N chunk đạt.
+        missing = _missing_entities(question, docs)
+        all_explicit_no = all(
+            not r["parse_failed"] and _is_no_match_aspect(r["reason"]) for r in grade_records
+        )
+        if missing or all_explicit_no:
+            print(
+                "[grade_documents] Out-of-scope gate: 0/"
+                f"{len(docs)} chunk đạt (thiếu thực thể={missing or 'không'}, "
+                f"toàn bộ 'Không có'={all_explicit_no}) -> trả về rỗng để từ chối an toàn."
+            )
+            return {"documents": [], "citations": []}
+
         top_doc = docs[0]
         if float(top_doc.metadata.get("relevance_score", 0.0)) >= 0.90:
             print("[grade_documents] Safety fallback: giữ lại top-1 chunk có điểm FlashRank cao.")
@@ -237,7 +306,7 @@ def _extract_pending_order(question: str) -> Dict[str, Any]:
     }
 
 
-async def call_mcp_tools(state: GraphState) -> Dict[str, Any]:
+async def call_mcp_tools(state: GraphState, config: RunnableConfig = None) -> Dict[str, Any]:
     """Node 5: Gọi công cụ thực tế từ FastMCP Server; chuẩn bị đơn chờ duyệt nếu là lệnh chốt đơn."""
     question = state["question"]
     mcp_output = await execute_mcp_tool_query(question)
@@ -245,6 +314,9 @@ async def call_mcp_tools(state: GraphState) -> Dict[str, Any]:
     is_commit_request = any(k in question.lower() for k in ORDER_COMMIT_KEYWORDS)
     if is_commit_request:
         pending_order = _extract_pending_order(question)
+        # Khóa idempotency gắn với thread + lượt chốt đơn; được checkpoint cùng state nên resume/retry dùng lại đúng khóa.
+        thread_id = _thread_id_from_config(config)
+        pending_order["idempotency_key"] = f"{thread_id or 'nothread'}:{uuid.uuid4().hex[:12]}"
         return {
             "mcp_result": mcp_output,
             "pending_order": pending_order,
@@ -267,64 +339,133 @@ def route_after_mcp(state: GraphState) -> str:
     return "generate"
 
 
-async def commit_erp_order(state: GraphState) -> Dict[str, Any]:
+def _thread_id_from_config(config: Optional[RunnableConfig]) -> str:
+    return str(((config or {}).get("configurable") or {}).get("thread_id") or "")
+
+
+def _ensure_erp_schema(conn: sqlite3.Connection) -> None:
+    """Tạo/migrate erp_orders (thêm idempotency_key) và erp_audit_log."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS erp_orders (
+            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            discount_percent REAL NOT NULL,
+            total_vnd REAL NOT NULL,
+            status TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            idempotency_key TEXT
+        )
+        """
+    )
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(erp_orders)").fetchall()}
+    if "idempotency_key" not in columns:
+        conn.execute("ALTER TABLE erp_orders ADD COLUMN idempotency_key TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_erp_orders_idem ON erp_orders(idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS erp_audit_log (
+            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT,
+            sku TEXT,
+            quantity INTEGER,
+            discount_percent REAL,
+            total_vnd REAL,
+            action TEXT NOT NULL,
+            created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        """
+    )
+
+
+def _audit(conn, thread_id, sku, quantity, discount, total, action) -> None:
+    conn.execute(
+        "INSERT INTO erp_audit_log (thread_id, sku, quantity, discount_percent, total_vnd, action) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (thread_id, sku, quantity, discount, total, action),
+    )
+
+
+async def commit_erp_order(state: GraphState, config: RunnableConfig = None) -> Dict[str, Any]:
     """
-    Node thực thi ghi giao dịch chốt đơn xuống data/erp_inventory.db.
+    Node thực thi ghi giao dịch chốt đơn xuống data/erp_inventory.db (idempotent).
     LangGraph tự động TẠM DỪNG ngay trước node này nhờ interrupt_before=['commit_erp_order'].
+    Gọi lặp lại với cùng idempotency_key (pending_order["idempotency_key"] hoặc thread_id)
+    KHÔNG trừ kho lần hai: trả lại kết quả đơn đã chốt trước đó.
     """
     order = state.get("pending_order") or {}
     sku = str(order.get("sku", "AI-WS-X1")).strip().upper()
     quantity = int(order.get("quantity", 1))
     discount = float(order.get("discount_percent", 0.0))
+    thread_id = _thread_id_from_config(config) or str(state.get("thread_id") or "")
+    idem_key = str(order.get("idempotency_key") or thread_id or "") or None
 
-    db_path = BASE_DIR / "data" / "erp_inventory.db"
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(_erp_db_path()), isolation_level=None, timeout=30)
     try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS erp_orders (
-                order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sku TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                discount_percent REAL NOT NULL,
-                total_vnd REAL NOT NULL,
-                status TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        _ensure_erp_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")  # khóa ghi: kiểm tra khóa + trừ kho là một khối nguyên tử
+        try:
+            if idem_key:
+                dup = conn.execute(
+                    "SELECT order_id, sku, quantity, discount_percent, total_vnd FROM erp_orders "
+                    "WHERE idempotency_key = ?",
+                    (idem_key,),
+                ).fetchone()
+                if dup:
+                    _audit(conn, thread_id, dup[1], dup[2], dup[3], dup[4], "DUPLICATE_IGNORED")
+                    conn.execute("COMMIT")
+                    return {
+                        "approval_status": "approved",
+                        "requires_approval": False,
+                        "mcp_result": (
+                            f"Đơn hàng #{dup[0]} đã được chốt trước đó (idempotent): {dup[2]} x {dup[1]}, "
+                            f"tổng thanh toán {int(dup[4]):,} VNĐ. Không trừ kho lần nữa."
+                        ),
+                    }
+
+            row = conn.execute(
+                "SELECT stock_qty, unit_price_vnd FROM inventory WHERE sku = ?",
+                (sku,),
+            ).fetchone()
+            if not row:
+                _audit(conn, thread_id, sku, quantity, discount, 0.0, "REJECTED_SKU_NOT_FOUND")
+                conn.execute("COMMIT")
+                return {
+                    "approval_status": "rejected",
+                    "requires_approval": False,
+                    "mcp_result": f"Không tìm thấy mã sản phẩm {sku} trong kho ERP.",
+                }
+
+            current_stock, unit_price = int(row[0]), float(row[1])
+            if quantity <= 0 or current_stock < quantity:
+                _audit(conn, thread_id, sku, quantity, discount, 0.0, "REJECTED_INSUFFICIENT_STOCK")
+                conn.execute("COMMIT")
+                return {
+                    "approval_status": "rejected",
+                    "requires_approval": False,
+                    "mcp_result": f"Tồn kho không đủ (hiện còn {current_stock}, yêu cầu {quantity}).",
+                }
+
+            final_total = round(unit_price * quantity * (1.0 - discount / 100.0), 2)
+            conn.execute(
+                "UPDATE inventory SET stock_qty = stock_qty - ? WHERE sku = ?",
+                (quantity, sku),
             )
-            """
-        )
-
-        row = cur.execute(
-            "SELECT stock_qty, unit_price_vnd FROM inventory WHERE sku = ?",
-            (sku,),
-        ).fetchone()
-        if not row:
-            return {
-                "approval_status": "rejected",
-                "requires_approval": False,
-                "mcp_result": f"Không tìm thấy mã sản phẩm {sku} trong kho ERP.",
-            }
-
-        current_stock, unit_price = int(row[0]), float(row[1])
-        if current_stock < quantity:
-            return {
-                "approval_status": "rejected",
-                "requires_approval": False,
-                "mcp_result": f"Tồn kho không đủ (hiện còn {current_stock}, yêu cầu {quantity}).",
-            }
-
-        final_total = round(unit_price * quantity * (1.0 - discount / 100.0), 2)
-        cur.execute(
-            "UPDATE inventory SET stock_qty = stock_qty - ? WHERE sku = ?",
-            (quantity, sku),
-        )
-        cur.execute(
-            "INSERT INTO erp_orders (sku, quantity, discount_percent, total_vnd, status) VALUES (?, ?, ?, ?, ?)",
-            (sku, quantity, discount, final_total, "COMMITTED"),
-        )
-        order_id = cur.lastrowid
-        conn.commit()
+            cur = conn.execute(
+                "INSERT INTO erp_orders (sku, quantity, discount_percent, total_vnd, status, idempotency_key) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (sku, quantity, discount, final_total, "COMMITTED", idem_key),
+            )
+            order_id = cur.lastrowid
+            _audit(conn, thread_id, sku, quantity, discount, final_total, "COMMITTED")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
 
         summary = (
             f"Đã chốt đơn hàng #{order_id}: {quantity} x {sku} "
@@ -340,12 +481,32 @@ async def commit_erp_order(state: GraphState) -> Dict[str, Any]:
         conn.close()
 
 
+async def _emit_deterministic_answer(text: str) -> str:
+    """
+    Phát câu trả lời cố định qua một chat model giả lập (không gọi Ollama) để
+    astream_events vẫn bắn `on_chat_model_stream` trong node `generate` -> SSE client nhận được token.
+    """
+    try:
+        from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+        from langchain_core.messages import AIMessage
+
+        fixed_llm = GenericFakeChatModel(messages=iter([AIMessage(content=text)]))
+        streamed = await (fixed_llm | StrOutputParser()).ainvoke(text)
+        return streamed or text
+    except Exception:
+        return text
+
+
 async def generate(state: GraphState) -> Dict[str, Any]:
     """Node 6: Tổng hợp câu trả lời cuối cùng (hỗ trợ streaming token)."""
     question = state["question"]
     datasource = state.get("datasource", "vectorstore")
     docs = state.get("documents", [])
     mcp_result = state.get("mcp_result", "")
+
+    if datasource == "vectorstore" and not docs:
+        # Từ chối tất định khi CRAG không giữ được chunk nào: tuyệt đối không để LLM tự bịa.
+        return {"generation": await _emit_deterministic_answer(OUT_OF_SCOPE_REFUSAL)}
 
     llm = get_llm(streaming=True)
 

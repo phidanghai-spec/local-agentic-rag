@@ -38,6 +38,8 @@ flashrank_cache/
 # ==========================================
 # Giữ lại data/erp_inventory.db (CSDL mẫu nhẹ), chỉ chặn file journal/lock và checkpoint khi chạy
 data/langgraph_checkpoints.sqlite*
+data/telemetry.sqlite*
+data/ingestion_manifest.json
 evaluation/eval_runs_cache.json
 *.db-wal
 *.db-shm
@@ -46,6 +48,14 @@ evaluation/eval_runs_cache.json
 *.log
 logs/
 agent_workspace/
+
+# ==========================================
+# Frontend (Next.js)
+# ==========================================
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
 
 # ==========================================
 # 4. Secrets & Environment Variables

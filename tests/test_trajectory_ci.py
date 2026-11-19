@@ -909,3 +909,170 @@ def test_prefilter_prevents_domain_starvation_before_rerank():
     assert len(prefiltered) == 3
     assert all(d.metadata["doc_domain"] == "system_architecture" for d in prefiltered)
     assert any("Cơ chế Truy xuất Lai" in d.page_content for d in prefiltered)
+
+
+# =====================================================================
+# TEST 16: PHÂN RÃ CÂU HỎI SO SÁNH + RRF MERGE GIỮ CẢ 2 THỰC THỂ
+# =====================================================================
+def test_comparison_query_decomposition_rrf_retrieves_both_entities(monkeypatch):
+    """
+    Câu hỏi "So sánh giá bán giữa A và B": A có 3 chunk điểm bão hòa, B chỉ 1 chunk điểm thấp hơn.
+    Truy vấn đơn sẽ để A chiếm trọn top-k; phân rã + RRF phải đưa cả A lẫn B vào kết quả.
+    Chạy offline: giả lập src.rag.indexing và create_hybrid_retriever (không cần Chroma/FlashRank).
+    """
+    import sys
+    import types
+
+    from src.rag import hybrid_retriever as hr
+
+    query = "So sánh giá bán giữa AI-WS-X1 và SSD-ENT-4T?"
+
+    sub_queries = hr._decompose_comparison_query(query)
+    assert len(sub_queries) == 2, sub_queries
+    assert "AI-WS-X1" in sub_queries[0] and "SSD-ENT-4T" not in sub_queries[0]
+    assert "SSD-ENT-4T" in sub_queries[1] and "AI-WS-X1" not in sub_queries[1]
+    assert all("giá bán" in sq for sq in sub_queries)
+    assert hr._decompose_comparison_query("A vs B") == ["A", "B"]
+    assert hr._decompose_comparison_query("Giá bán AI-WS-X1 là bao nhiêu?") == []
+    assert hr._decompose_comparison_query(
+        "Hệ thống dùng mô hình reranker nào và chạy trên phần cứng gì?"
+    ) == []
+
+    meta = {"source": "product_specs.md", "doc_domain": "product_catalog"}
+    corpus = [
+        Document(page_content="[Mục: AI-WS-X1] Giá bán niêm yết 58.900.000 VNĐ.", metadata=dict(meta)),
+        Document(page_content="[Mục: AI-WS-X1] Cấu hình GPU, RAM 128GB, giá bán kèm gói bảo hành.", metadata=dict(meta)),
+        Document(page_content="[Mục: AI-WS-X1] Chính sách giá bán sỉ cho đại lý.", metadata=dict(meta)),
+        Document(page_content="[Mục: SSD-ENT-4T] Giá bán niêm yết 12.500.000 VNĐ.", metadata=dict(meta)),
+    ]
+
+    def _entity_of(doc: Document) -> str:
+        return "SSD-ENT-4T" if "SSD-ENT-4T" in doc.page_content else "AI-WS-X1"
+
+    def _only_ssd(q: str) -> bool:
+        return "SSD-ENT-4T" in q and "AI-WS-X1" not in q
+
+    class _FakeBase:
+        async def ainvoke(self, q: str) -> List[Document]:
+            # Truy vấn gốc: A áp đảo thứ hạng; truy vấn con: ưu tiên đúng thực thể được hỏi.
+            preferred = "SSD-ENT-4T" if _only_ssd(q) else "AI-WS-X1"
+            return sorted(corpus, key=lambda d: _entity_of(d) != preferred)
+
+    class _FakeCompressor:
+        def compress_documents(self, docs: List[Document], q: str) -> List[Document]:
+            out = []
+            for rank, d in enumerate(docs):
+                if _entity_of(d) == "AI-WS-X1":
+                    score = 0.999 - rank * 0.0005 if "AI-WS-X1" in q else 0.10  # bão hòa sigmoid
+                else:
+                    score = 0.97 if _only_ssd(q) else 0.30
+                out.append(Document(page_content=d.page_content, metadata={**d.metadata, "relevance_score": score}))
+            return sorted(out, key=lambda d: d.metadata["relevance_score"], reverse=True)
+
+    class _FakeCompression:
+        base_retriever = _FakeBase()
+        base_compressor = _FakeCompressor()
+
+    fake_indexing = types.ModuleType("src.rag.indexing")
+    fake_indexing.build_or_load_vectorstore = lambda *a, **kw: object()
+    monkeypatch.setitem(sys.modules, "src.rag.indexing", fake_indexing)
+    monkeypatch.setattr(hr, "create_hybrid_retriever", lambda *a, **kw: _FakeCompression())
+
+    # Đối chứng: truy vấn đơn (không phân rã) bị AI-WS-X1 chiếm trọn top-k.
+    single = asyncio.run(
+        hr._retrieve_single_query(object(), _FakeCompression(), query, None)
+    )
+    assert single and all("SSD-ENT-4T" not in d.page_content for d in single)
+
+    merged = asyncio.run(hr.retrieve_with_fallback(query))
+    contents = [d.page_content for d in merged]
+    assert any("AI-WS-X1" in c for c in contents), contents
+    assert any("SSD-ENT-4T" in c for c in contents), contents
+    # RRF xen kẽ công bằng: 2 vị trí đầu thuộc 2 thực thể khác nhau.
+    assert {_entity_of(d) for d in merged[:2]} == {"AI-WS-X1", "SSD-ENT-4T"}
+    assert all("rrf_score" in d.metadata for d in merged)
+    assert len(contents) == len(set(contents)), "RRF không được trả về chunk trùng lặp"
+
+    # RRF thuần: chunk xuất hiện ở cả 2 danh sách được cộng dồn và đứng đầu.
+    a, b, shared = (Document(page_content=t, metadata={}) for t in ("A", "B", "shared"))
+    fused = hr._rrf_merge([[a, shared], [b, shared]])
+    assert fused[0].page_content == "shared"
+    assert {d.page_content for d in fused} == {"A", "B", "shared"}
+
+
+# =====================================================================
+# TEST 17: CỔNG TỪ CHỐI NGOÀI PHẠM VI (0/N CHUNK ĐẠT -> KHÔNG ÉP GIỮ SAI SẢN PHẨM)
+# =====================================================================
+def test_out_of_scope_zero_graded_chunks_returns_clean_refusal(monkeypatch):
+    """
+    Hỏi về sản phẩm KHÔNG có trong kho (LP-900) nhưng retriever trả về chunk AI-WS-X1 điểm 0.97.
+    Bản cũ: safety fallback ép giữ chunk sai sản phẩm (>= 0.90) -> LLM bịa giá.
+    Bản mới: grade_documents trả documents=[] và generate từ chối tất định, KHÔNG gọi LLM.
+    """
+    wrong_product_docs = [
+        Document(
+            page_content="[Mục: AI-WS-X1] Giá bán niêm yết 58.900.000 VNĐ, bảo hành 24 tháng.",
+            metadata={"source": "product_specs.md", "relevance_score": 0.97},
+        ),
+        Document(
+            page_content="[Mục: SSD-ENT-4T] Dung lượng 4TB NVMe, giá 12.500.000 VNĐ.",
+            metadata={"source": "product_specs.md", "relevance_score": 0.91},
+        ),
+    ]
+    question = "Giá bán của máy in laser mẫu LP-900 là bao nhiêu?"
+
+    llm_calls: List[str] = []
+
+    def _text_resolver(prompt_input) -> str:
+        llm_calls.append(str(prompt_input))
+        return "Máy in LP-900 có giá 58.900.000 VNĐ."  # câu trả lời bịa nếu LLM bị gọi
+
+    def _structured_resolver(schema, prompt_input):
+        return schema(matched_aspect="Không có", binary_score="no")
+
+    _patch_prod_llm(monkeypatch, FakeDeterministicLLM(_text_resolver, _structured_resolver))
+
+    def _state(docs: List[Document]) -> Dict[str, Any]:
+        return {
+            "question": question,
+            "rewritten_query": question,
+            "datasource": "vectorstore",
+            "metadata_filter": None,
+            "documents": docs,
+            "formatted_context": "",
+            "context_telemetry": {},
+            "citations": [
+                {"source": d.metadata["source"], "relevance_score": d.metadata["relevance_score"], "snippet": ""}
+                for d in docs
+            ],
+            "mcp_result": "",
+            "generation": "",
+            "hallucination_grade": "yes",
+            "retry_count": 0,
+        }
+
+    graded = asyncio.run(prod_nodes.grade_documents(_state(wrong_product_docs)))
+    assert graded["documents"] == [], "Không được ép giữ chunk sai sản phẩm khi 0/N chunk đạt"
+    assert graded["citations"] == []
+
+    # Grader 3B trả lời mâu thuẫn ('no' nhưng matched_aspect không phủ định) -> vẫn chặn vì thiếu thực thể LP-900.
+    _patch_prod_llm(
+        monkeypatch,
+        FakeDeterministicLLM(
+            _text_resolver,
+            lambda schema, _: schema(matched_aspect="Giá bán niêm yết", binary_score="no"),
+        ),
+    )
+    graded_missing = asyncio.run(prod_nodes.grade_documents(_state(wrong_product_docs)))
+    assert graded_missing["documents"] == []
+    assert prod_nodes._missing_entities(question, wrong_product_docs) == ["LP-900"]
+
+    generated = asyncio.run(prod_nodes.generate(_state([])))
+    answer = generated["generation"]
+    assert answer == prod_nodes.OUT_OF_SCOPE_REFUSAL
+    assert not llm_calls, "generate không được gọi LLM khi không có tài liệu (nguy cơ ảo giác)"
+    assert "LP-900" not in answer and "58.900.000" not in answer
+    assert "không có thông tin" in answer.lower()
+
+    # GRADE_SYSTEM_PROMPT vẫn sạch thực thể miền (đồng bộ với Test 14).
+    assert "lp-900" not in prod_nodes.GRADE_SYSTEM_PROMPT.lower()

@@ -34,6 +34,10 @@ SUMMARY_CSV_PATH = EVAL_DIR / "ragas_category_summary.csv"
 
 REFUSAL_MARKERS = (
     "không có thông tin",
+    "tài liệu hiện tại không có",
+    "không liên quan đến",
+    "không liên quan tới",
+    "không được đề cập",
     "không tìm thấy",
     "không đề cập",
     "không có trong tài liệu",

@@ -30,14 +30,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-ci.txt
 
-      - name: Run PII Proxy & Trajectory Eval CI Gate
+      - name: Run Full Test Suite & Trajectory Eval CI Gate
         env:
           PYTHONPATH: "."
         run: |
-          pytest tests/test_pii_proxy.py tests/test_trajectory_ci.py \
-            -v \
-            --tb=short \
-            --junitxml=trajectory-eval-report.xml
+          pytest tests/ -v --tb=short --junitxml=trajectory-eval-report.xml
 
       - name: Publish CI Summary
         if: always()
@@ -45,7 +42,7 @@ jobs:
           echo "### Trajectory Eval CI Gate Summary" >> "$GITHUB_STEP_SUMMARY"
           if [ -f trajectory-eval-report.xml ]; then
             echo "- Report generated: \`trajectory-eval-report.xml\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "- Verified: PIIProxy Guard + MCP 2-Step ERP Chain + CRAG Self-Correction Loop + Max Retry Cap" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Verified: Full Test Suite (PIIProxy Guard + MCP 2-Step ERP Chain + CRAG Self-Correction Loop + Max Retry Cap + Semantic Cache + Telemetry + Ingestion + API Integration)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload JUnit Trajectory Report

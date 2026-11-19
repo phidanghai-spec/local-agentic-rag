@@ -1,6 +1,7 @@
 """Module truy xuất lai (Hybrid Search: BM25 + Chroma Cosine) kèm FlashRank Reranker."""
 
 import math
+import re
 from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
@@ -98,9 +99,38 @@ def _sigmoid_to_logit(score: float) -> float:
     return math.log(clamped / (1.0 - clamped))
 
 
+_DYNAMIC_DOMAIN_REGISTRY: Dict[str, set[str]] = {}
+
+
+def register_domain_keywords(
+    domain: str, keywords: tuple[str, ...] | list[str]
+) -> None:
+    """Đăng ký danh sách từ khóa đại diện cho một domain động mới."""
+    if not domain:
+        return
+    cleaned_keywords = {k.strip().lower() for k in keywords if k and k.strip()}
+    if domain in _DYNAMIC_DOMAIN_REGISTRY:
+        _DYNAMIC_DOMAIN_REGISTRY[domain].update(cleaned_keywords)
+    else:
+        _DYNAMIC_DOMAIN_REGISTRY[domain] = set(cleaned_keywords)
+
+
+def clear_domain_registry() -> None:
+    """Xóa danh sách domain đã đăng ký động (hỗ trợ kiểm thử cô lập)."""
+    _DYNAMIC_DOMAIN_REGISTRY.clear()
+
+
+def get_registered_domains() -> Dict[str, List[str]]:
+    """Trả về từ điển các domain và từ khóa tương ứng đã được đăng ký."""
+    return {k: sorted(list(v)) for k, v in _DYNAMIC_DOMAIN_REGISTRY.items()}
+
+
 def _infer_query_domain(query: str) -> Optional[str]:
-    """Nhận diện nhanh ý định câu hỏi thuộc về kiến trúc hệ thống hay thông số sản phẩm bán ra."""
-    q = query.lower()
+    """Nhận diện nhanh ý định câu hỏi thuộc về kiến trúc hệ thống, thông số sản phẩm hoặc domain động."""
+    q = (query or "").lower()
+    if not q:
+        return None
+
     arch_keywords = (
         "kiến trúc", "rag", "rerank", "flashrank", "ollama", "langgraph",
         "triển khai", "hệ thống", "mô hình", "bm25", "chromadb", "embedding", "crag",
@@ -110,13 +140,21 @@ def _infer_query_domain(query: str) -> Optional[str]:
         "bảo hành", "đổi trả", "ổ cứng", "mua", "chiết khấu", "mã sản phẩm",
     )
 
-    has_arch = any(k in q for k in arch_keywords)
-    has_prod = any(k in q for k in prod_keywords)
+    matched_domains: set[str] = set()
 
-    if has_arch and not has_prod:
-        return "system_architecture"
-    if has_prod and not has_arch:
-        return "product_catalog"
+    if any(k in q for k in arch_keywords):
+        matched_domains.add("system_architecture")
+
+    if any(k in q for k in prod_keywords):
+        matched_domains.add("product_catalog")
+
+    for dyn_domain, dyn_keywords in _DYNAMIC_DOMAIN_REGISTRY.items():
+        if any(k in q for k in dyn_keywords):
+            matched_domains.add(dyn_domain)
+
+    if len(matched_domains) == 1:
+        return next(iter(matched_domains))
+
     return None
 
 
@@ -201,6 +239,185 @@ def filter_reranked_documents(
     return filtered_docs
 
 
+# =====================================================================
+# COMPARISON QUERY DECOMPOSITION + RECIPROCAL RANK FUSION (RRF)
+# =====================================================================
+_COMPARISON_TRIGGER_RE = re.compile(
+    r"\bso\s+sánh\b|\bđối\s+chiếu\b|\bkhác\s+(?:nhau|biệt|gì)\b|\bkhác\s+.+?\s+(?:so\s+với|với)\b"
+    r"|\bvs\.?(?=\s)|\bversus\b",
+    re.IGNORECASE,
+)
+_ENTITY_SPLIT_RE = re.compile(r"\s*,\s*|\s+(?:và|với|vs\.?|versus|hay|hoặc)\s+", re.IGNORECASE)
+_LEADING_NOISE_RE = re.compile(
+    r"^(?:hãy\s+|vui\s+lòng\s+|giúp\s+(?:tôi|mình)\s+)?"
+    r"(?:so\s+sánh|đối\s+chiếu|điểm\s+khác\s+(?:nhau|biệt)|sự\s+khác\s+(?:nhau|biệt)|khác\s+(?:nhau|biệt))\s*",
+    re.IGNORECASE,
+)
+_TRAILING_NOISE_RE = re.compile(
+    r"(?:\s*(?:như\s+thế\s+nào|thế\s+nào|ra\s+sao|là\s+gì|có\s+gì\s+khác(?:\s+nhau)?|khác\s+(?:nhau|biệt)"
+    r"(?:\s+(?:như\s+thế\s+nào|ra\s+sao|gì))?|nhé|ạ|nào\s+tốt\s+hơn|cái\s+nào\s+hơn))+\s*[?.!]*\s*$|\s*[?.!]+\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_fragment(text: str) -> str:
+    """Bỏ từ đệm đầu/cuối và khoảng trắng thừa trong một vế của câu so sánh."""
+    cleaned = _LEADING_NOISE_RE.sub("", text.strip())
+    cleaned = _TRAILING_NOISE_RE.sub("", cleaned)
+    cleaned = re.sub(r"^(?:về|giữa|của)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+(?:về|của)$", "", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", cleaned).strip(" ,;:-")
+
+
+def _split_entities(text: str) -> List[str]:
+    """Tách cụm thực thể 'A, B và C' thành danh sách ['A', 'B', 'C']."""
+    parts = [_clean_fragment(p) for p in _ENTITY_SPLIT_RE.split(_clean_fragment(text))]
+    return [p for p in parts if p]
+
+
+def _compose(aspect: str, entity: str) -> str:
+    return f"{aspect} {entity}".strip() if aspect else entity
+
+
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen: set = set()
+    out: List[str] = []
+    for item in items:
+        key = item.lower()
+        if item and key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def _decompose_comparison_query(query: str) -> List[str]:
+    """
+    Phân rã câu hỏi so sánh thành các truy vấn con, mỗi truy vấn tập trung vào MỘT thực thể,
+    để mỗi thực thể có suất truy xuất công bằng thay vì một bên chiếm trọn top-k.
+
+    Hỗ trợ các mẫu câu (không phân biệt hoa thường):
+    - "So sánh <khía cạnh> giữa A và B"           -> ["<khía cạnh> A", "<khía cạnh> B"]
+    - "Điểm khác nhau giữa A và B về <khía cạnh>" -> ["<khía cạnh> A", "<khía cạnh> B"]
+    - "So sánh A và/với B về <khía cạnh>"         -> ["A <khía cạnh>", "B <khía cạnh>"]
+    - "So sánh A với B" / "A vs B" / "A khác B như thế nào" -> ["A", "B"]
+
+    Trả về `[]` nếu không phải câu hỏi so sánh hoặc không tách được >= 2 thực thể.
+    """
+    q = (query or "").strip()
+    if not q or not _COMPARISON_TRIGGER_RE.search(q):
+        return []
+
+    aspect = ""
+    entities: List[str] = []
+
+    between = re.search(r"\bgiữa\s+(?P<ents>.+)$", q, flags=re.IGNORECASE)
+    if between:
+        prefix = q[: between.start()]
+        ents_text = between.group("ents")
+        tail_aspect = re.search(r"\s+(?:về|ở|theo|trên\s+phương\s+diện)\s+(?P<asp>.+)$", ents_text, re.IGNORECASE)
+        if tail_aspect:
+            aspect = _clean_fragment(tail_aspect.group("asp"))
+            ents_text = ents_text[: tail_aspect.start()]
+        if not aspect:
+            aspect = _clean_fragment(prefix)
+        entities = _split_entities(ents_text)
+    else:
+        body = _clean_fragment(q)
+        about = re.search(r"\s+(?:về|ở|theo|trên\s+phương\s+diện)\s+(?P<asp>.+)$", body, re.IGNORECASE)
+        if about:
+            aspect = _clean_fragment(about.group("asp"))
+            body = body[: about.start()]
+        diff = re.match(r"^(?P<a>.+?)\s+khác(?:\s+(?:gì|biệt|nhau))?\s+(?:so\s+với|với)\s+(?P<b>.+)$", body, re.IGNORECASE)
+        if diff:
+            entities = [_clean_fragment(diff.group("a")), _clean_fragment(diff.group("b"))]
+        else:
+            entities = _split_entities(body)
+        # Với mẫu "A và B về X", đặt thực thể trước khía cạnh để giữ trật tự tự nhiên.
+        if aspect and len(entities) >= 2:
+            return _dedupe_keep_order([f"{e} {aspect}" for e in entities if e])
+
+    entities = _dedupe_keep_order([e for e in entities if e])
+    if len(entities) < 2:
+        return []
+    return _dedupe_keep_order([_compose(aspect, e) for e in entities])
+
+
+def _doc_key(doc: Document) -> str:
+    return f"{doc.metadata.get('source', '')}::{doc.page_content}"
+
+
+def _rrf_merge(
+    ranked_lists: List[List[Document]],
+    k: int = 60,
+    top_n: Optional[int] = None,
+) -> List[Document]:
+    """
+    Reciprocal Rank Fusion: score(d) = Σ 1 / (k + rank_i(d) + 1).
+    Hạng 1 của MỌI danh sách con có điểm bằng nhau nên các thực thể được xen kẽ công bằng;
+    chunk xuất hiện ở nhiều danh sách được cộng dồn điểm và đẩy lên trước. Trùng lặp được gộp.
+    """
+    scores: Dict[str, float] = {}
+    first_seen: Dict[str, tuple] = {}
+    docs_by_key: Dict[str, Document] = {}
+
+    for list_idx, docs in enumerate(ranked_lists):
+        for rank, doc in enumerate(docs or []):
+            key = _doc_key(doc)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            if key not in docs_by_key:
+                docs_by_key[key] = doc
+                first_seen[key] = (rank, list_idx)
+
+    ordered_keys = sorted(scores, key=lambda key: (-scores[key], first_seen[key]))
+    merged: List[Document] = []
+    for key in ordered_keys:
+        doc = docs_by_key[key]
+        merged.append(
+            Document(
+                page_content=doc.page_content,
+                metadata={**doc.metadata, "rrf_score": round(scores[key], 6)},
+            )
+        )
+
+    return merged[:top_n] if top_n else merged
+
+
+async def _retrieve_single_query(
+    store: Any,
+    compression_retriever: Any,
+    query: str,
+    metadata_filter: Optional[Dict[str, Any]],
+    max_chunks: int = 3,
+) -> Optional[List[Document]]:
+    """Chạy trọn pipeline Ensemble -> Pre-filter domain -> FlashRank -> Logit/Jaccard cho 1 truy vấn."""
+    raw_candidates = await compression_retriever.base_retriever.ainvoke(query)
+
+    if metadata_filter and not raw_candidates:
+        fallback_retriever = create_hybrid_retriever(
+            vectorstore=store,
+            metadata_filter=None,
+        )
+        raw_candidates = await fallback_retriever.base_retriever.ainvoke(query)
+
+    if not raw_candidates:
+        return []
+
+    domain_candidates = prefilter_by_domain(raw_candidates, query)
+    reranked_docs = list(
+        compression_retriever.base_compressor.compress_documents(
+            domain_candidates, query
+        )
+    )
+
+    precision_docs = filter_reranked_documents(reranked_docs, query=query, max_chunks=max_chunks)
+    if precision_docs:
+        return precision_docs
+
+    if reranked_docs:
+        return [reranked_docs[0]]
+    return None  # FlashRank không trả kết quả -> để caller fallback sang ChromaDB thuần
+
+
 async def retrieve_with_fallback(
     query: str,
     metadata_filter: Optional[Dict[str, Any]] = None,
@@ -212,6 +429,9 @@ async def retrieve_with_fallback(
     2. Pre-filter theo doc_domain TRƯỚC khi đưa vào FlashRank.
     3. FlashRank Reranker chấm điểm riêng trên các ứng viên đúng domain.
     4. Logit Margin + Jaccard Filter chốt danh sách sạch.
+
+    Câu hỏi so sánh ("So sánh ... giữa A và B") được phân rã thành các truy vấn con theo
+    từng thực thể, truy xuất độc lập rồi hợp nhất bằng RRF để cả A và B đều có mặt.
     """
     from src.rag.indexing import build_or_load_vectorstore
 
@@ -221,31 +441,28 @@ async def retrieve_with_fallback(
             vectorstore=store,
             metadata_filter=metadata_filter,
         )
-        raw_candidates = await compression_retriever.base_retriever.ainvoke(query)
 
-        if metadata_filter and not raw_candidates:
-            fallback_retriever = create_hybrid_retriever(
-                vectorstore=store,
-                metadata_filter=None,
-            )
-            raw_candidates = await fallback_retriever.base_retriever.ainvoke(query)
+        sub_queries = _decompose_comparison_query(query)
+        if len(sub_queries) >= 2:
+            per_entity_docs: List[List[Document]] = []
+            for sub_query in sub_queries:
+                sub_docs = await _retrieve_single_query(
+                    store, compression_retriever, sub_query, metadata_filter, max_chunks=2
+                )
+                per_entity_docs.append(sub_docs or [])
+            merged = _rrf_merge(per_entity_docs, top_n=max(3, 2 * len(sub_queries)))
+            if merged:
+                print(
+                    f"[Retriever] Comparison decomposition {sub_queries} -> "
+                    f"{[len(d) for d in per_entity_docs]} chunks, RRF giữ {len(merged)}"
+                )
+                return merged
 
-        if not raw_candidates:
-            return []
-
-        domain_candidates = prefilter_by_domain(raw_candidates, query)
-        reranked_docs = list(
-            compression_retriever.base_compressor.compress_documents(
-                domain_candidates, query
-            )
+        single_docs = await _retrieve_single_query(
+            store, compression_retriever, query, metadata_filter
         )
-
-        precision_docs = filter_reranked_documents(reranked_docs, query=query)
-        if precision_docs:
-            return precision_docs
-
-        if reranked_docs:
-            return [reranked_docs[0]]
+        if single_docs is not None:
+            return single_docs
     except Exception as exc:
         print(f"[Retriever Warning] FlashRank gặp sự cố, chuyển về ChromaDB: {exc}")
 
