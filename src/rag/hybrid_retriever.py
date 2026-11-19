@@ -133,19 +133,20 @@ def filter_reranked_documents(
         return []
 
     target_domain = _infer_query_domain(query)
-    scored_items = []
 
-    for doc in docs:
+    # Tách cứng theo domain nếu nhận diện được phạm vi câu hỏi (có fallback nếu rỗng)
+    candidate_docs = docs
+    if target_domain:
+        same_domain_docs = [
+            d for d in docs if d.metadata.get("doc_domain") == target_domain
+        ]
+        if same_domain_docs:
+            candidate_docs = same_domain_docs
+
+    scored_items = []
+    for doc in candidate_docs:
         raw_score = float(doc.metadata.get("relevance_score", 0.0))
         logit = _sigmoid_to_logit(raw_score)
-
-        doc_domain = doc.metadata.get("doc_domain")
-        if target_domain and doc_domain:
-            if doc_domain == target_domain:
-                logit += 1.5
-            else:
-                logit -= 1.5
-
         scored_items.append((logit, raw_score, doc))
 
     scored_items.sort(key=lambda item: item[0], reverse=True)

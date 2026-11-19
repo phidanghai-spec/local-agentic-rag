@@ -22,21 +22,22 @@ ORDER_COMMIT_KEYWORDS = ("chốt đơn", "đặt mua", "tạo đơn hàng", "xá
 
 context_assembler = DynamicContextAssembler()
 
-GRADE_SYSTEM_PROMPT = """Bạn là bộ lọc tài liệu cho hệ thống RAG (ưu tiên không bỏ sót thông tin đúng).
+GRADE_SYSTEM_PROMPT = """Bạn là bộ lọc tài liệu cho hệ thống RAG. Chỉ đánh giá dựa trên ĐOẠN TÀI LIỆU THỰC TẾ được cung cấp bên dưới.
 
 QUY TẮC BẮT BUỘC:
-1. Tách câu hỏi thành các vế/ý nhỏ (ví dụ: câu hỏi có chữ 'và', 'hoặc', dấu phẩy thường gồm 2 vế riêng biệt).
-2. CHẤM 'yes' (GIỮ LẠI) nếu tài liệu chứa từ khóa, tên công nghệ, thông số hoặc trả lời được ÍT NHẤT MỘT VẾ của câu hỏi — KHÔNG yêu cầu một đoạn văn phải trả lời đầy đủ tất cả các vế.
-3. CHẤM 'no' (LOẠI BỎ) CHỈ KHI tài liệu nói về sản phẩm khác, chính sách khác hoặc hoàn toàn không giúp ích cho bất kỳ vế nào của câu hỏi.
+1. Tách câu hỏi thành từng vế/ý nhỏ (câu có 'và', 'hoặc', dấu phẩy thường gồm nhiều vế riêng).
+2. CHẤM 'yes' nếu ĐOẠN TÀI LIỆU THỰC TẾ chứa thông tin hoặc từ khóa trả lời được ÍT NHẤT MỘT VẾ của câu hỏi.
+3. CHẤM 'no' nếu ĐOẠN TÀI LIỆU THỰC TẾ nói về đối tượng khác hoặc không chứa thông tin cho bất kỳ vế nào.
+4. TRUNG THỰC TUỆT ĐỐI: Trường `matched_aspect` CHỈ ĐƯỢC phép nhắc tên khái niệm/con số có thật trong ĐOẠN TÀI LIỆU THỰC TẾ. Tuyệt đối KHÔNG sao chép nội dung từ ví dụ minh họa. Nếu không khớp, ghi đúng chuỗi 'Không có'.
 
-VÍ DỤ MẪU:
-- Câu hỏi: "Hệ thống dùng mô hình reranker nào và chạy trên phần cứng gì?"
-  Tài liệu: "[Mục: Cơ chế Truy xuất Lai] Sử dụng FlashRank ms-marco-MultiBERT-L-12 để xếp hạng lại kết quả."
-  -> matched_aspect: "Trả lời vế mô hình reranker (FlashRank ms-marco-MultiBERT-L-12)" | binary_score: "yes"
+VÍ DỤ MINH HỌA (CHỈ ĐỂ HIỂU CÁCH LÀM, KHÔNG DÙNG NỘI DUNG NÀY ĐỂ TRẢ LỜI):
+- Câu hỏi: "Cửa hàng giao hàng trong bao lâu và phí vận chuyển nội thành là bao nhiêu?"
+  Tài liệu: "[Mục: Biểu phí] Phí vận chuyển nội thành cố định 25.000đ cho mọi đơn dưới 5kg."
+  Kết quả: matched_aspect="Phí vận chuyển nội thành 25.000đ" | binary_score="yes"
 
-- Câu hỏi: "Thông số kỹ thuật của Laptop AI Workstation X1 là gì?"
-  Tài liệu: "[Mục: Ổ cứng SSD-ENT-4T] Dung lượng 4TB NVMe, bảo hành 36 tháng."
-  -> matched_aspect: "Không có (tài liệu nói về SSD-ENT-4T, sai sản phẩm)" | binary_score: "no"
+- Câu hỏi: "Thời gian bảo hành của máy lọc không khí mẫu K200 là mấy năm?"
+  Tài liệu: "[Mục: Hướng dẫn đổi trả] Khách hàng được đổi mới trong 7 ngày nếu hộp còn nguyên tem."
+  Kết quả: matched_aspect="Không có" | binary_score="no"
 """
 
 
@@ -150,8 +151,9 @@ async def grade_documents(state: GraphState) -> Dict[str, Any]:
             ("system", GRADE_SYSTEM_PROMPT),
             (
                 "human",
-                "Câu hỏi người dùng:\n{question}\n\n"
-                "Đoạn tài liệu cần đánh giá:\n{document}",
+                "[CÂU HỎI THỰC TẾ]\n{question}\n\n"
+                "[ĐOẠN TÀI LIỆU THỰC TẾ]\n{document}\n\n"
+                "Hãy trích vế khớp có thật trong [ĐOẠN TÀI LIỆU THỰC TẾ] vào `matched_aspect` rồi quyết định `binary_score`.",
             ),
         ]
     )

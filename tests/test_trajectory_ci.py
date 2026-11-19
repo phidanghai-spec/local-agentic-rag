@@ -859,3 +859,26 @@ def test_hitl_reject_skips_commit_preserves_stock(tmp_path, monkeypatch):
 
     assert _read_sku_stock(sandbox_db, "AI-WS-X1") == stock_before
     assert len(_count_committed_orders(sandbox_db, "AI-WS-X1")) == 0
+
+
+# =====================================================================
+# TEST 14: KHÓA CHỐNG TÁI DIỄN FEW-SHOT BLEED TRONG GRADE_SYSTEM_PROMPT
+# =====================================================================
+def test_grade_prompt_has_no_domain_few_shot_bleed():
+    """
+    Đảm bảo GRADE_SYSTEM_PROMPT chỉ dùng ví dụ miền trung lập,
+    không chứa thực thể thật trong data/*.md gây Few-shot Bleed trên model 3B.
+    """
+    prompt_lower = prod_nodes.GRADE_SYSTEM_PROMPT.lower()
+    forbidden_domain_tokens = (
+        "flashrank",
+        "multibert",
+        "ai-ws-x1",
+        "ssd-ent-4t",
+        "qwen2.5",
+        "intel hd",
+    )
+    leaked = [tok for tok in forbidden_domain_tokens if tok in prompt_lower]
+    assert not leaked, (
+        f"Phát hiện thực thể thật rò rỉ trong GRADE_SYSTEM_PROMPT (nguy cơ Few-shot Bleed): {leaked}"
+    )

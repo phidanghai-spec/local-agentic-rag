@@ -1,5 +1,7 @@
 # 🤖 Local Agentic RAG & MCP Assistant (`v1.0`)
 
+[![Trajectory Eval CI Gate](https://github.com/phidanghai-spec/local-agentic-rag/actions/workflows/trajectory-eval-ci.yml/badge.svg)](https://github.com/phidanghai-spec/local-agentic-rag/actions/workflows/trajectory-eval-ci.yml)
+
 > **Deep Dive:** Đọc bài phân tích kiến trúc & nhật ký gỡ lỗi thực chiến trên model 3B tại [**`docs/ARCHITECTURE_TEARDOWN.md`**](./docs/ARCHITECTURE_TEARDOWN.md).
 
 Hệ thống **Local Agentic RAG** chuẩn Production vận hành hoàn toàn trên máy cá nhân (On-premise), kết hợp **LangGraph Adaptive CRAG**, **Hybrid Search (BM25 + Chroma Cosine + FlashRank)**, **Dynamic Context Assembler**, **PII Security Proxy**, **FastMCP Tools** và **FastAPI SSE Streaming** — tối ưu hóa cho phần cứng giới hạn (CPU / iGPU) với **Ollama (`qwen2.5-coder:3b` & `nomic-embed-text`)**.
